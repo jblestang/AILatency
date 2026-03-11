@@ -6,11 +6,32 @@ Application egui pour simuler la latence d’un pipeline de traitement (débit 1
 
 ---
 
-## Lancer l’app
+## Lancer l’app (natif)
 
 ```bash
 cargo run
 ```
+
+## Version Web (WASM)
+
+L’app peut être compilée en WebAssembly et exécutée dans le navigateur.
+
+1. Installer la cible wasm et [Trunk](https://trunkrs.dev/) :
+   ```bash
+   rustup target add wasm32-unknown-unknown
+   cargo install trunk
+   ```
+2. Depuis le dossier `latency_sim`, lancer le serveur de dev :
+   ```bash
+   trunk serve
+   ```
+3. Ouvrir http://127.0.0.1:8080 dans le navigateur.
+
+Pour une build de production (fichiers statiques dans `dist/`) :
+   ```bash
+   trunk build --release
+   ```
+   puis héberger le contenu de `dist/` (ex. GitHub Pages).
 
 ---
 

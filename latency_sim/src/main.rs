@@ -1,6 +1,27 @@
 use eframe::egui;
-use egui_plot::{CoordinatesFormatter, Corner, GridInput, GridMark, Line, Plot, PlotPoints, VLine};
+use egui_plot::{
+    CoordinatesFormatter, Corner, GridInput, GridMark, Line, Plot, PlotPoints, Points, VLine,
+};
 
+fn slider_with_buttons(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    step: f32,
+) {
+    ui.horizontal(|ui| {
+        if ui.button("-").clicked() {
+            *value = (*value - step).max(*range.start());
+        }
+        if ui.button("+").clicked() {
+            *value = (*value + step).min(*range.end());
+        }
+        ui.add(egui::Slider::new(value, range).text(label));
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -14,6 +35,48 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|_cc| Ok(Box::new(AppState::default()))),
     )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    use eframe::wasm_bindgen::JsCast as _;
+
+    eframe::WebLogger::init(log::LevelFilter::Debug).ok();
+
+    let web_options = eframe::WebOptions::default();
+
+    wasm_bindgen_futures::spawn_local(async {
+        let document = web_sys::window()
+            .and_then(|w| w.document())
+            .expect("No document");
+        let canvas = document
+            .get_element_by_id("the_canvas_id")
+            .expect("Missing #the_canvas_id")
+            .dyn_into::<web_sys::HtmlCanvasElement>()
+            .expect("#the_canvas_id not a canvas");
+
+        let result = eframe::WebRunner::new()
+            .start(
+                canvas,
+                web_options,
+                Box::new(|_cc| Ok(Box::new(AppState::default()))),
+            )
+            .await;
+
+        if let Some(loading) = document.get_element_by_id("loading_text") {
+            match result {
+                Ok(_) => {
+                    let _ = loading.remove();
+                }
+                Err(e) => {
+                    loading.set_inner_html(&format!(
+                        "<p>Erreur: {}</p>",
+                        e.as_string().unwrap_or_else(|| "?".into())
+                    ));
+                }
+            }
+        }
+    });
 }
 
 #[derive(Debug)]
@@ -48,6 +111,15 @@ struct AppState {
     p1: PartitionParams,
     p2: PartitionParams,
     p3: PartitionParams,
+
+    /// Décomposition du coût fixe de P2.
+    /// p2_fixed_total = p2_fixed_base_us + p2_fixed_codec_us
+    p2_fixed_base_us: f32,
+    p2_fixed_codec_us: f32,
+
+    /// Si vrai, on retire 42 octets (Ethernet+IP+UDP) du calcul de débit (payload seulement).
+    exclude_l2_headers: bool,
+
 }
 
 impl Default for AppState {
@@ -60,21 +132,34 @@ impl Default for AppState {
             cs_sq: 0.5,
             p1: PartitionParams {
                 fixed_us: 20.0,
-                per_byte_ns: 2.0,
+                per_byte_ns: 100.0,
             },
             p2: PartitionParams {
-                fixed_us: 80.0,
-                per_byte_ns: 8.0,
+                fixed_us: 120.0,
+                per_byte_ns: 100.0,
             },
             p3: PartitionParams {
                 fixed_us: 20.0,
-                per_byte_ns: 2.0,
+                per_byte_ns: 100.0,
             },
+
+            p2_fixed_base_us: 60.0,
+            p2_fixed_codec_us: 60.0,
+
+            exclude_l2_headers: false,
         }
     }
 }
 
 impl AppState {
+    fn effective_size_bytes(&self, size_bytes: f32) -> f32 {
+        if self.exclude_l2_headers {
+            (size_bytes - 42.0).max(1.0)
+        } else {
+            size_bytes.max(1.0)
+        }
+    }
+
     fn part_latency_us(&self, p: &PartitionParams, size_bytes: f32) -> f32 {
         let s = size_bytes.max(1.0);
         p.fixed_us + (p.per_byte_ns * s) / 1000.0
@@ -91,9 +176,22 @@ impl AppState {
     /// Temps par étage (µs) pour la taille de paquet courante: [P1, P2, P3].
     fn stage_times_us(&self, size_bytes: f32) -> [f32; 3] {
         let s = size_bytes.max(1.0);
+        let p2_effective = PartitionParams {
+            fixed_us: self.p2_fixed_base_us + self.p2_fixed_codec_us,
+            per_byte_ns: self.p2.per_byte_ns,
+        };
         [
             self.part_latency_us(&self.p1, s),
-            self.part_latency_us(&self.p2, s),
+            self.part_latency_us(&p2_effective, s),
+            self.part_latency_us(&self.p3, s),
+        ]
+    }
+
+    fn stage_times_us_with_p2(&self, size_bytes: f32, p2: PartitionParams) -> [f32; 3] {
+        let s = size_bytes.max(1.0);
+        [
+            self.part_latency_us(&self.p1, s),
+            self.part_latency_us(&p2, s),
             self.part_latency_us(&self.p3, s),
         ]
     }
@@ -122,7 +220,7 @@ impl AppState {
 
     fn packets_per_second(&self) -> f32 {
         let bits_per_second = self.throughput_mbps.max(0.1) * 1_000_000.0;
-        let bits_per_packet = self.packet_size_bytes.max(1.0) * 8.0;
+        let bits_per_packet = self.effective_size_bytes(self.packet_size_bytes) * 8.0;
         bits_per_second / bits_per_packet
     }
 
@@ -137,7 +235,7 @@ impl AppState {
     /// Inter-arrivée (µs) si tous les paquets avaient la même taille `size_bytes`.
     fn inter_arrival_us_for_size(&self, size_bytes: f32) -> f32 {
         let bps = self.throughput_mbps.max(0.1) * 1_000_000.0;
-        let bits_per_packet = size_bytes.max(1.0) * 8.0;
+        let bits_per_packet = self.effective_size_bytes(size_bytes) * 8.0;
         let pps = bps / bits_per_packet;
         if pps <= 0.0 {
             return f32::INFINITY;
@@ -274,63 +372,100 @@ impl eframe::App for AppState {
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.heading("Paramètres globaux");
-                    ui.add(
-                        egui::Slider::new(&mut self.throughput_mbps, 1.0..=100.0)
-                            .text("Débit (Mbps)"),
+                    slider_with_buttons(
+                        ui,
+                        "Débit (Mbps)",
+                        &mut self.throughput_mbps,
+                        1.0..=100.0,
+                        1.0,
                     );
-                    ui.add(
-                        egui::Slider::new(&mut self.packet_size_bytes, 64.0..=1500.0)
-                            .text("Taille paquet (octets)"),
+                    slider_with_buttons(
+                        ui,
+                        "Taille paquet (octets)",
+                        &mut self.packet_size_bytes,
+                        64.0..=1500.0,
+                        16.0,
                     );
-                    ui.add(
-                        egui::Slider::new(&mut self.latency_budget_us, 100.0..=5000.0)
-                            .text("Budget latence (µs)"),
+                    slider_with_buttons(
+                        ui,
+                        "Budget latence (µs)",
+                        &mut self.latency_budget_us,
+                        100.0..=5000.0,
+                        50.0,
+                    );
+                    ui.checkbox(
+                        &mut self.exclude_l2_headers,
+                        "Débit exprimé hors Ethernet/IP/UDP (-42 octets)",
                     );
 
                     ui.separator();
                     ui.heading("G/G/1 (variabilité)");
                     ui.label("c_a² = carré C.V. inter-arrivées (Poisson = 1)");
-                    ui.add(
-                        egui::Slider::new(&mut self.ca_sq, 0.0..=5.0)
-                            .text("c_a²"),
-                    );
+                    slider_with_buttons(ui, "c_a²", &mut self.ca_sq, 0.0..=5.0, 0.1);
                     ui.label("c_s² = carré C.V. temps de service (Déterministe = 0)");
-                    ui.add(
-                        egui::Slider::new(&mut self.cs_sq, 0.0..=5.0)
-                            .text("c_s²"),
-                    );
+                    slider_with_buttons(ui, "c_s²", &mut self.cs_sq, 0.0..=5.0, 0.1);
 
                     ui.separator();
                     ui.heading("Partition 1");
-                    ui.add(
-                        egui::Slider::new(&mut self.p1.fixed_us, 0.0..=200.0)
-                            .text("Fixe (µs)"),
+                    slider_with_buttons(
+                        ui,
+                        "Fixe (µs)",
+                        &mut self.p1.fixed_us,
+                        0.0..=200.0,
+                        5.0,
                     );
-                    ui.add(
-                        egui::Slider::new(&mut self.p1.per_byte_ns, 0.0..=50.0)
-                            .text("Par octet (ns)"),
+                    slider_with_buttons(
+                        ui,
+                        "Par octet (ns)",
+                        &mut self.p1.per_byte_ns,
+                        0.0..=100.0,
+                        5.0,
                     );
 
                     ui.separator();
                     ui.heading("Partition 2");
-                    ui.add(
-                        egui::Slider::new(&mut self.p2.fixed_us, 0.0..=300.0)
-                            .text("Fixe (µs)"),
+                    ui.label("Coût fixe P2 = socle + codec");
+                    slider_with_buttons(
+                        ui,
+                        "Fixe socle (µs)",
+                        &mut self.p2_fixed_base_us,
+                        0.0..=300.0,
+                        5.0,
                     );
-                    ui.add(
-                        egui::Slider::new(&mut self.p2.per_byte_ns, 0.0..=100.0)
-                            .text("Par octet (ns)"),
+                    slider_with_buttons(
+                        ui,
+                        "Fixe codec (µs)",
+                        &mut self.p2_fixed_codec_us,
+                        0.0..=300.0,
+                        5.0,
+                    );
+                    ui.label(format!(
+                        "Total P2 fixe: {:.1} µs",
+                        self.p2_fixed_base_us + self.p2_fixed_codec_us
+                    ));
+                    slider_with_buttons(
+                        ui,
+                        "Par octet (ns)",
+                        &mut self.p2.per_byte_ns,
+                        0.0..=100.0,
+                        5.0,
                     );
 
                     ui.separator();
                     ui.heading("Partition 3");
-                    ui.add(
-                        egui::Slider::new(&mut self.p3.fixed_us, 0.0..=200.0)
-                            .text("Fixe (µs)"),
+                    slider_with_buttons(
+                        ui,
+                        "Fixe (µs)",
+                        &mut self.p3.fixed_us,
+                        0.0..=200.0,
+                        5.0,
                     );
-                    ui.add(
-                        egui::Slider::new(&mut self.p3.per_byte_ns, 0.0..=50.0)
-                            .text("Par octet (ns)"),
+                    slider_with_buttons(
+                        ui,
+                        "Par octet (ns)",
+                        &mut self.p3.per_byte_ns,
+                        0.0..=100.0,
+                        5.0,
                     );
                 });
             });
@@ -340,7 +475,7 @@ impl eframe::App for AppState {
             ui.vertical(|ui| {
                 ui.heading("Pipeline");
                 let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width().min(450.0), 120.0),
+                    egui::vec2(ui.available_width().min(600.0), 180.0),
                     egui::Sense::hover(),
                 );
                 let painter = ui.painter();
@@ -352,15 +487,15 @@ impl eframe::App for AppState {
                 let wb = w / 4.0;
                 let b1 = egui::Rect::from_center_size(
                     egui::pos2(pr.left() + wb * 0.5, y),
-                    egui::vec2(wb * 0.7, h * 0.5),
+                    egui::vec2(wb * 0.8, h * 0.6),
                 );
                 let b2 = egui::Rect::from_center_size(
                     egui::pos2(pr.left() + wb * 1.7, y),
-                    egui::vec2(wb * 0.7, h * 0.5),
+                    egui::vec2(wb * 0.8, h * 0.6),
                 );
                 let b3 = egui::Rect::from_center_size(
                     egui::pos2(pr.left() + wb * 2.9, y),
-                    egui::vec2(wb * 0.7, h * 0.5),
+                    egui::vec2(wb * 0.8, h * 0.6),
                 );
                 let part_lat = |p: &PartitionParams| -> f32 {
                     let s = self.packet_size_bytes.max(1.0);
@@ -450,15 +585,13 @@ impl eframe::App for AppState {
                 ui.label("Latence (avec files) vs taille de paquet — axe Y en échelle log (valeurs ∞ plafonnées pour affichage)");
 
                 let y_min = 1.0_f64;
-                // Hors contrainte (ρ≥1) la latence est infinie ; on plafonne pour l’affichage.
                 let y_max_display = (self.latency_budget_us * 50.0).max(100_000.0) as f64;
                 let mut latency_vec = Vec::new();
                 let mut budget_vec = Vec::new();
                 for size in (64..=1500).step_by(32) {
                     let size_f = size as f32;
                     let inter = self.inter_arrival_us_for_size(size_f);
-                    let total_with_queue =
-                        self.total_latency_with_queuing_us(size_f, inter);
+                    let total_with_queue = self.total_latency_with_queuing_us(size_f, inter);
                     let lat = if total_with_queue.is_finite() {
                         total_with_queue as f64
                     } else {
@@ -476,8 +609,9 @@ impl eframe::App for AppState {
                 let budget_curve =
                     Line::new(PlotPoints::from(budget_vec)).name("Budget (µs)");
                 let selected_x = self.packet_size_bytes.max(1.0) as f64;
+
                 Plot::new("latency_vs_packet_size")
-                    .height(900.0)
+                    .height(700.0)
                     .legend(egui_plot::Legend::default())
                     .allow_zoom(true)
                     .allow_drag(true)
@@ -525,10 +659,8 @@ impl eframe::App for AppState {
                         CoordinatesFormatter::new(|pt, _bounds| {
                             let size_bytes = pt.x;
                             let inter = self.inter_arrival_us_for_size(size_bytes as f32);
-                            let lat = self.total_latency_with_queuing_us(
-                                size_bytes as f32,
-                                inter,
-                            );
+                            let lat =
+                                self.total_latency_with_queuing_us(size_bytes as f32, inter);
                             let lat_str = if lat.is_finite() {
                                 format!("{:.1}", lat)
                             } else {
