@@ -1,5 +1,5 @@
 use eframe::egui;
-use egui_plot::{CoordinatesFormatter, Corner, Line, Plot, PlotPoints, VLine};
+use egui_plot::{CoordinatesFormatter, Corner, GridInput, GridMark, Line, Plot, PlotPoints, VLine};
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -56,8 +56,8 @@ impl Default for AppState {
             throughput_mbps: 40.0,
             packet_size_bytes: 600.0,
             latency_budget_us: 1000.0,
-            ca_sq: 1.0,
-            cs_sq: 0.0,
+            ca_sq: 2.0,
+            cs_sq: 0.5,
             p1: PartitionParams {
                 fixed_us: 20.0,
                 per_byte_ns: 2.0,
@@ -447,10 +447,11 @@ impl eframe::App for AppState {
                 );
 
                 ui.add_space(8.0);
-                ui.label("Latence (avec files) vs taille de paquet — axe Y en échelle log");
+                ui.label("Latence (avec files) vs taille de paquet — axe Y en échelle log (valeurs ∞ plafonnées pour affichage)");
 
                 let y_min = 1.0_f64;
-                let y_max_display = (self.latency_budget_us * 5.0).max(10_000.0) as f64;
+                // Hors contrainte (ρ≥1) la latence est infinie ; on plafonne pour l’affichage.
+                let y_max_display = (self.latency_budget_us * 50.0).max(100_000.0) as f64;
                 let mut latency_vec = Vec::new();
                 let mut budget_vec = Vec::new();
                 for size in (64..=1500).step_by(32) {
@@ -495,6 +496,29 @@ impl eframe::App for AppState {
                         } else {
                             format!("{:.2}", v)
                         }
+                    })
+                    .y_grid_spacer(|input: GridInput| {
+                        let (lo, hi) = input.bounds;
+                        let mut marks = Vec::new();
+                        let mut v = 1.0_f64;
+                        while v <= 1e9 {
+                            for &mult in &[1.0, 2.0, 5.0] {
+                                let x = mult * v;
+                                let y = x.ln();
+                                if y >= lo - 1e-9 && y <= hi + 1e-9 {
+                                    let step = if mult == 1.0 { 10.0 * v } else { v };
+                                    marks.push(GridMark {
+                                        value: y,
+                                        step_size: step.ln(),
+                                    });
+                                }
+                            }
+                            v *= 10.0;
+                            if v > 1e9 {
+                                break;
+                            }
+                        }
+                        marks
                     })
                     .coordinates_formatter(
                         Corner::RightBottom,
