@@ -53,21 +53,21 @@ struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
-            throughput_mbps: 16.0,
-            packet_size_bytes: 512.0,
+            throughput_mbps: 40.0,
+            packet_size_bytes: 600.0,
             latency_budget_us: 1000.0,
             ca_sq: 1.0,
             cs_sq: 0.0,
             p1: PartitionParams {
-                fixed_us: 10.0,
+                fixed_us: 20.0,
                 per_byte_ns: 2.0,
             },
             p2: PartitionParams {
-                fixed_us: 40.0,
+                fixed_us: 80.0,
                 per_byte_ns: 8.0,
             },
             p3: PartitionParams {
-                fixed_us: 10.0,
+                fixed_us: 20.0,
                 per_byte_ns: 2.0,
             },
         }
@@ -476,7 +476,7 @@ impl eframe::App for AppState {
                     Line::new(PlotPoints::from(budget_vec)).name("Budget (µs)");
                 let selected_x = self.packet_size_bytes.max(1.0) as f64;
                 Plot::new("latency_vs_packet_size")
-                    .height(520.0)
+                    .height(900.0)
                     .legend(egui_plot::Legend::default())
                     .allow_zoom(true)
                     .allow_drag(true)
