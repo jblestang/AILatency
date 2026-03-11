@@ -33,6 +33,12 @@ Pour une build de production (fichiers statiques dans `dist/`) :
    ```
    puis héberger le contenu de `dist/` (ex. GitHub Pages).
 
+### Tester en ligne (GitHub Pages)
+
+Chaque push sur `main` déclenche un déploiement automatique. Une fois GitHub Pages activé (Settings → Pages → Source : **GitHub Actions**), l’app est disponible à :
+
+**https://jblestang.github.io/AILatency/**
+
 ---
 
 ## Algorithme
