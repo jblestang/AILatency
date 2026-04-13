@@ -633,13 +633,9 @@ impl eframe::App for AppState {
                     Line::new(PlotPoints::from(budget_vec)).name("Budget (µs)");
                 let selected_x = self.packet_size_bytes.max(1.0) as f64;
                 let throughput_bps = (self.throughput_mbps.max(0.1) as f64) * 1_000_000.0;
-                let top_ticks_bytes = [
-                    64.0_f64, 128.0, 256.0, 512.0, 1024.0, 1500.0, 2048.0, 4096.0, 8192.0,
-                    16384.0, 32768.0, 65536.0,
-                ];
-                let mut x_bounds_ln: Option<(f64, f64)> = None;
+                let exclude_l2_headers = self.exclude_l2_headers;
 
-                let plot_response = Plot::new("latency_vs_packet_size")
+                Plot::new("latency_vs_packet_size")
                     .height(700.0)
                     .legend(egui_plot::Legend::default())
                     .allow_zoom(true)
@@ -648,8 +644,23 @@ impl eframe::App for AppState {
                     .allow_boxed_zoom(true)
                     .include_x((64.0_f64).ln())
                     .include_x((65536.0_f64).ln())
-                    .x_axis_formatter(|mark, _range| {
-                        format!("{:.0} octets", mark.value.exp())
+                    .x_axis_label("Taille (octets) · paquets/s (même débit)")
+                    .x_axis_formatter(move |mark, _range| {
+                        let size_bytes = mark.value.exp().max(1.0);
+                        let eff = if exclude_l2_headers {
+                            (size_bytes - 42.0).max(1.0)
+                        } else {
+                            size_bytes
+                        };
+                        let pps = throughput_bps / (eff * 8.0);
+                        let pps_str = if pps >= 1_000_000.0 {
+                            format!("{:.2} Mpps", pps / 1_000_000.0)
+                        } else if pps >= 1_000.0 {
+                            format!("{:.1} kpps", pps / 1_000.0)
+                        } else {
+                            format!("{:.0} pps", pps)
+                        };
+                        format!("{:.0} o · {pps_str}", size_bytes)
                     })
                     .x_grid_spacer(|input: GridInput| {
                         let (lo, hi) = input.bounds;
@@ -727,8 +738,6 @@ impl eframe::App for AppState {
                     .show(ui, |plot_ui: &mut egui_plot::PlotUi| {
                         plot_ui.line(latency_curve);
                         plot_ui.line(budget_curve);
-                        let bounds = plot_ui.plot_bounds();
-                        x_bounds_ln = Some((bounds.min()[0], bounds.max()[0]));
                         plot_ui.vline(
                             VLine::new(selected_x.ln())
                                 .color(egui::Color32::YELLOW)
@@ -736,47 +745,6 @@ impl eframe::App for AppState {
                                 .name("Taille sélectionnée"),
                         );
                     });
-
-                if let Some((x_lo, x_hi)) = x_bounds_ln {
-                    let rect = plot_response.response.rect;
-                    let painter = ui.painter();
-                    let y_ticks = rect.top() + 18.0;
-                    let y_title = rect.top() + 4.0;
-
-                    painter.text(
-                        egui::pos2(rect.center().x, y_title),
-                        egui::Align2::CENTER_TOP,
-                        "Axe secondaire: paquets/s (pps)",
-                        egui::FontId::proportional(11.0),
-                        egui::Color32::LIGHT_GRAY,
-                    );
-
-                    for size_bytes in top_ticks_bytes {
-                        let x_ln = size_bytes.ln();
-                        if x_ln < x_lo || x_ln > x_hi {
-                            continue;
-                        }
-                        let t = ((x_ln - x_lo) / (x_hi - x_lo + 1e-12)) as f32;
-                        let x_screen = rect.left() + t * rect.width();
-                        let effective_size =
-                            self.effective_size_bytes(size_bytes as f32) as f64;
-                        let pps = throughput_bps / (effective_size * 8.0);
-                        let label = if pps >= 1_000_000.0 {
-                            format!("{:.2}M", pps / 1_000_000.0)
-                        } else if pps >= 1_000.0 {
-                            format!("{:.1}k", pps / 1_000.0)
-                        } else {
-                            format!("{:.0}", pps)
-                        };
-                        painter.text(
-                            egui::pos2(x_screen, y_ticks),
-                            egui::Align2::CENTER_TOP,
-                            label,
-                            egui::FontId::monospace(10.0),
-                            egui::Color32::LIGHT_GRAY,
-                        );
-                    }
-                }
             });
         });
     }
