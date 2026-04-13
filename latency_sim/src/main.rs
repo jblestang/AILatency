@@ -379,13 +379,15 @@ impl eframe::App for AppState {
                         1.0..=100.0,
                         1.0,
                     );
-                    slider_with_buttons(
-                        ui,
-                        "Taille paquet (octets)",
-                        &mut self.packet_size_bytes,
-                        64.0..=1500.0,
-                        16.0,
-                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("-").clicked() {
+                            self.packet_size_bytes = (self.packet_size_bytes - 16.0).max(64.0);
+                        }
+                        if ui.button("+").clicked() {
+                            self.packet_size_bytes = (self.packet_size_bytes + 16.0).min(65536.0);
+                        }
+                        ui.add(egui::Slider::new(&mut self.packet_size_bytes, 64.0..=65536.0).logarithmic(true).text("Taille paquet (octets)"));
+                    });
                     slider_with_buttons(
                         ui,
                         "Budget latence (µs)",
@@ -588,8 +590,8 @@ impl eframe::App for AppState {
                 let y_max_display = (self.latency_budget_us * 50.0).max(100_000.0) as f64;
                 let mut latency_vec = Vec::new();
                 let mut budget_vec = Vec::new();
-                for size in (64..=1500).step_by(32) {
-                    let size_f = size as f32;
+                let mut size_f = 64.0;
+                while size_f <= 65536.0 {
                     let inter = self.inter_arrival_us_for_size(size_f);
                     let total_with_queue = self.total_latency_with_queuing_us(size_f, inter);
                     let lat = if total_with_queue.is_finite() {
@@ -597,38 +599,88 @@ impl eframe::App for AppState {
                     } else {
                         y_max_display
                     };
+                    let x = (size_f as f64).max(1.0).ln();
                     let y = (lat).max(y_min).ln();
-                    latency_vec.push([size_f as f64, y]);
+                    latency_vec.push([x, y]);
                     budget_vec.push([
-                        size_f as f64,
+                        x,
+                        (self.latency_budget_us as f64).max(y_min).ln(),
+                    ]);
+                    size_f *= 1.05; // 5% increase for log spacing
+                }
+                // add final point to ensure we hit the upper bound exactly
+                {
+                    let size_f = 65536.0;
+                    let inter = self.inter_arrival_us_for_size(size_f);
+                    let total_with_queue = self.total_latency_with_queuing_us(size_f, inter);
+                    let lat = if total_with_queue.is_finite() {
+                        total_with_queue as f64
+                    } else {
+                        y_max_display
+                    };
+                    let x = (size_f as f64).max(1.0).ln();
+                    let y = (lat).max(y_min).ln();
+                    latency_vec.push([x, y]);
+                    budget_vec.push([
+                        x,
                         (self.latency_budget_us as f64).max(y_min).ln(),
                     ]);
                 }
+
                 let latency_curve =
                     Line::new(PlotPoints::from(latency_vec)).name("Latence avec files (µs)");
                 let budget_curve =
                     Line::new(PlotPoints::from(budget_vec)).name("Budget (µs)");
                 let selected_x = self.packet_size_bytes.max(1.0) as f64;
+                let throughput_bps = (self.throughput_mbps.max(0.1) as f64) * 1_000_000.0;
+                let top_ticks_bytes = [
+                    64.0_f64, 128.0, 256.0, 512.0, 1024.0, 1500.0, 2048.0, 4096.0, 8192.0,
+                    16384.0, 32768.0, 65536.0,
+                ];
+                let mut x_bounds_ln: Option<(f64, f64)> = None;
 
-                Plot::new("latency_vs_packet_size")
+                let plot_response = Plot::new("latency_vs_packet_size")
                     .height(700.0)
                     .legend(egui_plot::Legend::default())
                     .allow_zoom(true)
                     .allow_drag(true)
                     .allow_scroll(true)
                     .allow_boxed_zoom(true)
-                    .include_x(64.0)
-                    .include_x(1500.0)
+                    .include_x((64.0_f64).ln())
+                    .include_x((65536.0_f64).ln())
+                    .x_axis_formatter(|mark, _range| {
+                        format!("{:.0} octets", mark.value.exp())
+                    })
+                    .x_grid_spacer(|input: GridInput| {
+                        let (lo, hi) = input.bounds;
+                        let mut marks = Vec::new();
+                        let mut v = 10.0_f64;
+                        while v <= 100_000.0 {
+                            for &mult in &[1.0, 2.0, 5.0] {
+                                let x_val = v * mult;
+                                let x_ln = x_val.ln();
+                                if x_ln >= lo - 1e-9 && x_ln <= hi + 1e-9 {
+                                    let step = if mult == 1.0 { 10.0 * v } else { v };
+                                    marks.push(GridMark {
+                                        value: x_ln,
+                                        step_size: step.ln(),
+                                    });
+                                }
+                            }
+                            v *= 10.0;
+                        }
+                        marks
+                    })
                     .y_axis_formatter(|mark, _range| {
                         let v = mark.value.exp();
                         if v >= 1000.0 {
-                            format!("{:.0}", v)
+                            format!("{:.0} µs", v)
                         } else if v >= 10.0 {
-                            format!("{:.0}", v)
+                            format!("{:.0} µs", v)
                         } else if v >= 1.0 {
-                            format!("{:.1}", v)
+                            format!("{:.1} µs", v)
                         } else {
-                            format!("{:.2}", v)
+                            format!("{:.2} µs", v)
                         }
                     })
                     .y_grid_spacer(|input: GridInput| {
@@ -657,7 +709,7 @@ impl eframe::App for AppState {
                     .coordinates_formatter(
                         Corner::RightBottom,
                         CoordinatesFormatter::new(|pt, _bounds| {
-                            let size_bytes = pt.x;
+                            let size_bytes = pt.x.exp();
                             let inter = self.inter_arrival_us_for_size(size_bytes as f32);
                             let lat =
                                 self.total_latency_with_queuing_us(size_bytes as f32, inter);
@@ -675,13 +727,56 @@ impl eframe::App for AppState {
                     .show(ui, |plot_ui: &mut egui_plot::PlotUi| {
                         plot_ui.line(latency_curve);
                         plot_ui.line(budget_curve);
+                        let bounds = plot_ui.plot_bounds();
+                        x_bounds_ln = Some((bounds.min()[0], bounds.max()[0]));
                         plot_ui.vline(
-                            VLine::new(selected_x)
+                            VLine::new(selected_x.ln())
                                 .color(egui::Color32::YELLOW)
                                 .width(2.0)
                                 .name("Taille sélectionnée"),
                         );
                     });
+
+                if let Some((x_lo, x_hi)) = x_bounds_ln {
+                    let rect = plot_response.response.rect;
+                    let painter = ui.painter();
+                    let y_ticks = rect.top() + 18.0;
+                    let y_title = rect.top() + 4.0;
+
+                    painter.text(
+                        egui::pos2(rect.center().x, y_title),
+                        egui::Align2::CENTER_TOP,
+                        "Axe secondaire: paquets/s (pps)",
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::LIGHT_GRAY,
+                    );
+
+                    for size_bytes in top_ticks_bytes {
+                        let x_ln = size_bytes.ln();
+                        if x_ln < x_lo || x_ln > x_hi {
+                            continue;
+                        }
+                        let t = ((x_ln - x_lo) / (x_hi - x_lo + 1e-12)) as f32;
+                        let x_screen = rect.left() + t * rect.width();
+                        let effective_size =
+                            self.effective_size_bytes(size_bytes as f32) as f64;
+                        let pps = throughput_bps / (effective_size * 8.0);
+                        let label = if pps >= 1_000_000.0 {
+                            format!("{:.2}M", pps / 1_000_000.0)
+                        } else if pps >= 1_000.0 {
+                            format!("{:.1}k", pps / 1_000.0)
+                        } else {
+                            format!("{:.0}", pps)
+                        };
+                        painter.text(
+                            egui::pos2(x_screen, y_ticks),
+                            egui::Align2::CENTER_TOP,
+                            label,
+                            egui::FontId::monospace(10.0),
+                            egui::Color32::LIGHT_GRAY,
+                        );
+                    }
+                }
             });
         });
     }
